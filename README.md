@@ -50,14 +50,45 @@ make
 #### 预期输出
 
 ```
-=== Flash KV Unit Tests ===
-Test: KV set/get... PASS
-Test: KV update... PASS
-Test: KV not found... PASS
-Test: Type utils... PASS
+========================================
+     Flash KV Unit Tests
+========================================
 
-=== All Tests PASSED ===
+  [Test] KV Set/Get Basic Operations
+  [-] SET: key="device_name", value="sensor_001"
+  [+] SET OK
+  [-] GET: key="device_name", value="sensor_001" (len=64)
+  [+] GET OK, value match!
+  ...
+
+  [Test] KV Update (Same Key, Different Value)
+  [-] SET: key="firmware_version", value="v1.0.0"
+  [-] UPDATE: key="firmware_version", value="v1.0.1"
+  ...
+
+  [Test] Stress Test - Multiple KV Pairs
+  [-] Progress: 10/50
+  [-] Progress: 20/50
+  ...
+  [+] Wrote 50 keys
+  [+] Verified 50 keys
+
+========================================
+     All Tests PASSED!
+========================================
 ```
+
+#### 测试用例
+
+- **基本操作测试** - Set/Get/Exists 基础功能
+- **更新测试** - 相同Key更新Value
+- **删除测试** - Delete键值对
+- **不存在测试** - 获取不存在的Key
+- **类型工具测试** - u8/u16/u32/float/double/bool 转换
+- **边界测试** - 空Key、空Value、超长Key/Value
+- **清除测试** - Clear后数据清空
+- **状态测试** - 存储使用情况查询
+- **压力测试** - 50个键值对批量写入验证
 
 ## 项目结构
 

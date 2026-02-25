@@ -50,14 +50,45 @@ make
 #### Expected Output
 
 ```
-=== Flash KV Unit Tests ===
-Test: KV set/get... PASS
-Test: KV update... PASS
-Test: KV not found... PASS
-Test: Type utils... PASS
+========================================
+     Flash KV Unit Tests
+========================================
 
-=== All Tests PASSED ===
+  [Test] KV Set/Get Basic Operations
+  [-] SET: key="device_name", value="sensor_001"
+  [+] SET OK
+  [-] GET: key="device_name", value="sensor_001" (len=64)
+  [+] GET OK, value match!
+  ...
+
+  [Test] KV Update (Same Key, Different Value)
+  [-] SET: key="firmware_version", value="v1.0.0"
+  [-] UPDATE: key="firmware_version", value="v1.0.1"
+  ...
+
+  [Test] Stress Test - Multiple KV Pairs
+  [-] Progress: 10/50
+  [-] Progress: 20/50
+  ...
+  [+] Wrote 50 keys
+  [+] Verified 50 keys
+
+========================================
+     All Tests PASSED!
+========================================
 ```
+
+#### Test Cases
+
+- **Basic Operations** - Set/Get/Exists
+- **Update** - Same key with different value
+- **Delete** - Delete key-value pairs
+- **Not Found** - Get non-existent key
+- **Type Utils** - u8/u16/u32/float/double/bool conversion
+- **Boundary** - Empty key/value, oversized key/value
+- **Clear** - Clear all data
+- **Status** - Storage usage query
+- **Stress Test** - Batch write and verify 50 key-value pairs
 
 ## Project Structure
 
