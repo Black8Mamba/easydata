@@ -624,21 +624,122 @@ extern const flash_kv_ops_t flash_kv_default_adapter;
 
 ## 6. 核心实现思路
 
-### 6.1 索引机制
+### 6.1 哈希表索引机制
 
-为提高查询效率，维护内存索引：
+采用**开放地址法哈希表**，提高查询效率：
+
+#### 哈希表配置
+
+```c
+/* 哈希表大小 (必须是2的幂，便于取模) */
+#define FLASH_KV_HASH_SIZE      512
+
+/* 哈希函数: DJB2 */
+#define KV_HASH(key, len)      kv_hash_djb2(key, len)
+
+static inline uint16_t kv_hash_djb2(const uint8_t *key, uint8_t len) {
+    uint32_t hash = 5381;
+    for (uint8_t i = 0; i < len; i++) {
+        hash = ((hash << 5) + hash) + key[i];  /* hash * 33 + key[i] */
+    }
+    return hash & (FLASH_KV_HASH_SIZE - 1);
+}
+```
+
+#### 哈希表结构
 
 ```c
 typedef struct {
-    uint8_t key_hash;         /* Key哈希值(用于快速查找) */
-    uint32_t offset;           /* 在Flash中的偏移 */
-} kv_index_entry_t;
+    uint8_t  key_len;          /* Key长度，0表示空槽 */
+    uint8_t  key[FLASH_KV_KEY_SIZE];  /* Key内容 */
+    uint32_t flash_offset;     /* 在Flash中的偏移 */
+} kv_hash_slot_t;
+
+typedef struct {
+    kv_hash_slot_t slots[FLASH_KV_HASH_SIZE];
+    uint16_t count;            /* 已存储的键值对数量 */
+} kv_hash_table_t;
 ```
 
-**查询流程**:
-1. 计算Key的哈希值
-2. 遍历索引，找到匹配的Key
-3. 从Flash读取对应Value
+#### 索引操作
+
+**查找 (O(1) 平均)**:
+```c
+int kv_hash_get(const uint8_t *key, uint8_t key_len, uint32_t *offset) {
+    uint16_t hash = KV_HASH(key, key_len);
+
+    for (int i = 0; i < FLASH_KV_HASH_SIZE; i++) {
+        uint16_t idx = (hash + i) & (FLASH_KV_HASH_SIZE - 1);  /* 线性探测 */
+        kv_hash_slot_t *slot = &hash_table->slots[idx];
+
+        if (slot->key_len == 0) {
+            return -1;  /* 未找到 */
+        }
+
+        if (slot->key_len == key_len &&
+            memcmp(slot->key, key, key_len) == 0) {
+            *offset = slot->flash_offset;
+            return 0;  /* 找到 */
+        }
+    }
+    return -1;  /* 未找到 */
+}
+```
+
+**插入/更新 (O(1) 平均)**:
+```c
+int kv_hash_set(const uint8_t *key, uint8_t key_len, uint32_t offset) {
+    uint16_t hash = KV_HASH(key, key_len);
+
+    for (int i = 0; i < FLASH_KV_HASH_SIZE; i++) {
+        uint16_t idx = (hash + i) & (FLASH_KV_HASH_SIZE - 1);
+        kv_hash_slot_t *slot = &hash_table->slots[idx];
+
+        /* 空槽或Key相同 -> 插入/更新 */
+        if (slot->key_len == 0 || (slot->key_len == key_len &&
+            memcmp(slot->key, key, key_len) == 0)) {
+            slot->key_len = key_len;
+            memcpy(slot->key, key, key_len);
+            slot->flash_offset = offset;
+            return 0;
+        }
+    }
+
+    return -1;  /* 哈希表已满 */
+}
+```
+
+#### 哈希表重建
+
+GC完成后需要重建哈希表：
+
+```c
+void kv_hash_rebuild(void) {
+    memset(hash_table, 0, sizeof(kv_hash_table_t));
+
+    /* 遍历Flash，重新构建哈希表 */
+    uint32_t offset = sizeof(kv_region_header_t);
+    while (offset < region->active_offset) {
+        kv_record_t record;
+        flash_read(region_addr + offset, &record, sizeof(record));
+
+        if (kv_record_valid(&record)) {
+            kv_hash_set(record.key, FLASH_KV_KEY_SIZE, offset);
+        }
+        offset += FLASH_KV_RECORD_SIZE;
+    }
+}
+```
+
+#### 内存占用
+
+| 项目 | 大小 |
+|------|------|
+| 哈希表槽数 | 512 |
+| 每槽大小 | 1 + 32 + 4 = 37 字节 |
+| 总内存 | 约 19 KB |
+
+> 注：哈希表大小可根据实际条目数量调整，建议设置为预期最大条目的 1.5-2 倍。
 
 ### 6.2 GC策略
 
@@ -750,6 +851,7 @@ void app_example(void) {
 | 平台无关 | Flash适配层，定义统一接口，用户实现具体驱动 |
 | 固定长度KV | 配置化 Key/Value 长度，默认32/64字节 |
 | 日志式 | 追加写入，更新操作变成新增记录 |
+| 索引 | 哈希表 (开放地址法)，O(1) 查找复杂度 |
 | GC | 被动+手动，扫描有效记录并复制到新区 |
 | 双备份 | A/B区交替使用，通过版本号选择活跃区 |
 | 原子性 | 预留区写入 + 版本号原子更新 |
