@@ -227,7 +227,7 @@ gcc -o flash_kv_test \
 
 ### 2.2 单区内部布局
 
-每区包含：头部信息 + 日志数据区
+每区包含：头部信息 + 预留区 + 日志数据区
 
 ```
 +--------------------------------+
@@ -235,15 +235,26 @@ gcc -o flash_kv_test \
 |  - magic number               |
 |  - 版本号                      |
 |  - 记录计数                    |
+|  - 预留区起始偏移              |
 |  - CRC32                      |
 +--------------------------------+
 |                                |
-|  日志数据区                    |  30KB
+|  日志数据区                    |  28KB
 |  [Record 1] [Record 2] ...    |
 |  追加写入                      |
 |                                |
 +--------------------------------+
+|  预留区 (1块)                  |  2KB
+|  用于原子写入临时存储          |
++--------------------------------+
 ```
+
+#### 预留区说明
+
+- **位置**: 每区末尾，占1个块大小
+- **用途**: 用于原子写入操作，临时存储新记录
+- **大小**: 与块大小相同（如2KB）
+- **工作原理**: 见3.1节事务机制
 
 ### 2.3 记录格式 (Record)
 
@@ -257,6 +268,19 @@ gcc -o flash_kv_test \
 - **Value**: 固定长度，不足补0x00
 - **Meta**: 包含 flags(1B) + reserved(3B)
 - **CRC16**: 每条记录的校验和
+
+#### Meta flags 定义
+
+```
+bit7 | bit6 | bit5 | bit4 | bit3 | bit2 | bit1 | bit0
+-----|-----|-----|-----|-----|-----|-----|-----
+  0  |  0  |  0  |  0  |  0  |  0  |  0  | VALID
+```
+
+| 位 | 名称 | 说明 |
+|----|------|------|
+| bit0 | VALID | 1=有效记录，0=无效/已删除 |
+| bit1-7 | Reserved | 保留位，当前为0 |
 
 ### 2.4 双备份机制
 
@@ -476,15 +500,38 @@ typedef struct {
 } __attribute__((packed)) kv_record_t;
 
 /*============================================================================
+ * 魔术字定义
+ *============================================================================*/
+#define KV_MAGIC              0x4B565341  /* "KVSA" - KV Storage Area A */
+#define KV_MAGIC_B             0x4B565342  /* "KVSB" - KV Storage Area B */
+
+/*============================================================================
+ * CRC算法定义
+ *============================================================================*/
+#define KV_CRC16_POLY         0x1021      /* CRC-16-CCITT */
+#define KV_CRC32_POLY         0x04C11DB7  /* CRC-32 */
+
+/*============================================================================
  * 区域头部
  *============================================================================*/
 typedef struct {
-    uint32_t magic;           /* 魔术字: 0x4B5653xx */
-    uint32_t version;         /* 版本号 */
-    uint32_t record_count;    /* 有效记录数 */
-    uint32_t active_offset;   /* 活跃数据结束偏移 */
+    uint32_t magic;           /* 魔术字: KV_MAGIC 或 KV_MAGIC_B */
+    uint32_t version;         /* 版本号 (递增) */
+    uint32_t record_count;     /* 有效记录数 */
+    uint32_t active_offset;    /* 活跃数据结束偏移 */
+    uint8_t  tx_state;        /* 事务状态: 0=IDLE, 1=PREPARED, 2=COMMITTED */
+    uint8_t  reserved[3];     /* 保留对齐 */
     uint32_t crc32;           /* 头部CRC */
 } __attribute__((packed)) kv_region_header_t;
+
+/**
+ * @brief 事务状态 (持久化到Flash)
+ */
+typedef enum {
+    KV_TX_STATE_IDLE = 0,          /* 无事务 */
+    KV_TX_STATE_PREPARED = 1,    /* 预留区已写入，待提交 */
+    KV_TX_STATE_COMMITTED = 2    /* 已提交 */
+} kv_tx_state_persist_t;
 
 #endif /* FLASH_KV_TYPES_H */
 ```
@@ -777,8 +824,13 @@ extern const flash_kv_ops_t flash_kv_default_adapter;
 #### 哈希表配置
 
 ```c
-/* 哈希表大小 (必须是2的幂，便于取模) */
-#define FLASH_KV_HASH_SIZE      512
+/* 哈希表大小 (必须是2的幂，便于取模)
+ * 建议: 设为最大记录数的1.5-2倍，降低冲突率
+ * 当前: 1024 = 512条记录的2倍，load factor ≤ 50% */
+#define FLASH_KV_HASH_SIZE      1024
+
+/* 最大记录数 (需小于哈希表大小) */
+#define FLASH_KV_MAX_RECORDS    512
 
 /* 哈希函数: DJB2 */
 #define KV_HASH(key, len)      kv_hash_djb2(key, len)
@@ -990,7 +1042,184 @@ void app_example(void) {
 
 ---
 
-## 8. 关键技术点总结
+## 8. 补充设计细节
+
+### 8.1 GC中断电保护 (问题4)
+
+GC过程中断电会导致数据丢失，采用**两阶段GC**策略：
+
+```
+阶段1: 准备阶段
+  1. 在备份区写入新头部 (version+1, state=GC_PREPARING)
+  2. 复制所有有效记录到备份区
+  3. 写入新头部 (version+1, state=GC_READY)
+
+阶段2: 提交阶段 (原子操作)
+  1. 切换活跃区指针
+  2. 旧区头部标记为无效 (version+1, state=GC_DONE)
+
+阶段3: 清理阶段
+  1. 擦除旧区
+```
+
+**断电恢复**:
+- 上电检测GC状态，如果是GC_PREPARING或GC_READY，说明GC未完成
+- 从备份区恢复数据，继续完成GC
+
+```c
+typedef enum {
+    GC_STATE_IDLE = 0,
+    GC_STATE_PREPARING,   /* 复制中 */
+    GC_STATE_READY,       /* 复制完成，待切换 */
+    GC_STATE_DONE         /* GC完成，待擦除旧区 */
+} kv_gc_state_t;
+```
+
+### 8.2 线程安全设计 (问题5)
+
+嵌入式多线程场景需要考虑并发访问：
+
+```c
+/* 线程安全配置 */
+#define FLASH_KV_THREAD_SAFE   1   /* 1=启用线程安全 */
+
+/* 全局锁 (用户实现) */
+extern void kv_lock(void);
+extern void kv_unlock(void);
+
+/* 带锁的写入操作 */
+int flash_kv_set_safe(const uint8_t *key, uint8_t key_len,
+                      const uint8_t *value, uint8_t value_len)
+{
+#if FLASH_KV_THREAD_SAFE
+    kv_lock();
+#endif
+
+    int ret = flash_kv_set_impl(key, key_len, value, value_len);
+
+#if FLASH_KV_THREAD_SAFE
+    kv_unlock();
+#endif
+    return ret;
+}
+```
+
+**注意**: 如果在中断上下文使用，需要使用`kv_lock_irqsave()`/`kv_unlock_irqrestore()`。
+
+### 8.3 Version溢出处理 (问题9)
+
+uint32_t版本号最大约43亿次写入，对于嵌入式设备足够。
+
+**溢出策略**:
+- 当version接近溢出时，执行一次全量擦除重置
+- 或使用64位版本号（如果Flash支持）
+
+```c
+/* 版本溢出检测 */
+#define KV_VERSION_MAX         0xFFFFFFFE
+
+if (handle->version >= KV_VERSION_MAX) {
+    /* 执行全量重置 */
+    flash_kv_reset();
+}
+```
+
+### 8.4 事务与GC互斥 (问题8)
+
+事务进行中应禁止GC触发：
+
+```c
+int flash_kv_set_impl(const uint8_t *key, uint8_t key_len,
+                       const uint8_t *value, uint8_t value_len)
+{
+    kv_handle_t *handle = kv_get_handle();
+
+    /* 检查事务状态 - 事务进行中禁止GC */
+    if (handle->tx_state == KV_TX_STATE_PREPARED) {
+        return KV_ERR_TRANSACTION;
+    }
+
+    /* 检查是否需要GC (但事务进行中不触发) */
+    if (handle->tx_state == KV_TX_STATE_IDLE &&
+        flash_kv_free_percent() < FLASH_KV_GC_THRESHOLD) {
+        /* 可以选择返回错误让用户决定是否GC */
+        return KV_ERR_NO_SPACE;
+    }
+
+    /* 执行写入 */
+    // ...
+}
+```
+
+### 8.5 首次初始化设计 (问题11)
+
+首次使用需要擦除并初始化区域：
+
+```c
+int flash_kv_init_first(uint8_t instance_id,
+                         const kv_instance_config_t *config)
+{
+    uint32_t region_addr[2];
+    region_addr[0] = config->start_addr;
+    region_addr[1] = config->start_addr + config->total_size / 2;
+
+    /* 擦除A区和B区 */
+    for (int i = 0; i < 2; i++) {
+        flash_kv_ops.erase(region_addr[i], config->total_size / 2);
+    }
+
+    /* 写入A区头部 */
+    kv_region_header_t header = {
+        .magic = KV_MAGIC,
+        .version = 1,
+        .record_count = 0,
+        .active_offset = sizeof(kv_region_header_t),
+        .tx_state = KV_TX_STATE_IDLE,
+        .crc32 = 0
+    };
+    header.crc32 = kv_crc32(&header, sizeof(header) - 4);
+    flash_kv_ops.write(region_addr[0], &header, sizeof(header));
+
+    return KV_OK;
+}
+```
+
+### 8.6 写入失败处理 (问题12)
+
+Flash写入可能失败（如写入超时），需要重试机制：
+
+```c
+/* 写入重试配置 */
+#define FLASH_KV_WRITE_RETRY_MAX   3
+#define FLASH_KV_WRITE_RETRY_DELAY_MS  10
+
+int flash_kv_write_with_retry(uint32_t addr, const uint8_t *buf,
+                               uint32_t len)
+{
+    int ret;
+
+    for (int retry = 0; retry < FLASH_KV_WRITE_RETRY_MAX; retry++) {
+        ret = flash_kv_ops.write(addr, buf, len);
+        if (ret == KV_OK) {
+            /* 验证写入 */
+            uint8_t verify_buf[256];
+            flash_kv_ops.read(addr, verify_buf, len);
+            if (memcmp(buf, verify_buf, len) == 0) {
+                return KV_OK;
+            }
+        }
+
+        /* 延时后重试 */
+        delay_ms(FLASH_KV_WRITE_RETRY_DELAY_MS);
+    }
+
+    return KV_ERR_FLASH_FAIL;
+}
+```
+
+---
+
+## 9. 关键技术点总结
 
 | 需求 | 实现方案 |
 |------|----------|
