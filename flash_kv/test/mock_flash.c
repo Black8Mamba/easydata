@@ -17,10 +17,12 @@ static int mem_flash_init(void)
 {
     g_flash.size = 64 * 1024;  /* 64KB for testing */
     g_flash.block_size = FLASH_KV_BLOCK_SIZE;
-    g_flash.memory = calloc(g_flash.size, 1);
+    g_flash.memory = malloc(g_flash.size);
     if (g_flash.memory == NULL) {
         return -1;
     }
+    /* 初始化为0xFF，模拟未使用的Flash */
+    memset(g_flash.memory, 0xFF, g_flash.size);
     return 0;
 }
 

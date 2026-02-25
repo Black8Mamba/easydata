@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdio.h>
 #include "flash_kv.h"
 #include "flash_kv_hash.h"
 #include "flash_kv_crc.h"

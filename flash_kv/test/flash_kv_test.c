@@ -2,6 +2,7 @@
 #include <string.h>
 #include <assert.h>
 #include "flash_kv.h"
+#include "flash_kv_utils.h"
 
 extern const flash_kv_ops_t mock_flash_ops;
 
@@ -31,7 +32,7 @@ void test_kv_set_get(void)
     uint8_t len = sizeof(read_val);
     ret = flash_kv_get(key, sizeof(key) - 1, read_val, &len);
     assert(ret == KV_OK);
-    assert(len == sizeof(value) - 1);
+    assert(len == FLASH_KV_VALUE_SIZE);
     assert(memcmp(read_val, value, sizeof(value) - 1) == 0);
 
     /* 存在检查 */
