@@ -1,0 +1,27 @@
+# 编译产物
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+
+# 调试文件
+*.d
+*.lst
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# 构建目录
+build/
+Debug/
+Release/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
