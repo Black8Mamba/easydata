@@ -323,7 +323,8 @@ int flash_kv_get(const uint8_t *key, uint8_t key_len,
         return KV_ERR_CRC_FAIL;
     }
 
-    /* 复制value */
+    /* 复制value - 先清零缓冲区防止乱码 */
+    memset(value, 0, FLASH_KV_VALUE_SIZE);
     memcpy(value, record.value, record.value_len);
     *value_len = record.value_len;
 
