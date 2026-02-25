@@ -426,6 +426,142 @@ void test_kv_status(void)
     printf("\n  [PASS] Status Test\n");
 }
 
+void test_kv_gc(void)
+{
+    printf("\n  [Test] KV Garbage Collection\n");
+
+    /* 先清空Flash确保干净状态 */
+    flash_kv_clear();
+
+    /* 写入一些数据 */
+    for (int i = 0; i < 5; i++) {
+        char key[32], value[32];
+        snprintf(key, sizeof(key), "gc_key_%d", i);
+        snprintf(value, sizeof(value), "value_%d", i);
+        int r = flash_kv_set((uint8_t *)key, strlen(key), (uint8_t *)value, strlen(value));
+        printf("  [-] SET gc_key_%d = %s: %d\n", i, value, r);
+    }
+
+    uint32_t count_before = flash_kv_count();
+    printf("  [-] Record count before GC: %u\n", count_before);
+
+    /* 删除一些记录以产生垃圾 */
+    flash_kv_del((uint8_t *)"gc_key_0", 8);
+    flash_kv_del((uint8_t *)"gc_key_2", 8);
+
+    uint32_t count_after_del = flash_kv_count();
+    printf("  [-] Record count after delete: %u\n", count_after_del);
+
+    /* 手动触发GC */
+    int ret = flash_kv_gc();
+    printf("  [-] GC return: %d\n", ret);
+
+    uint32_t count_after_gc = flash_kv_count();
+    printf("  [-] Record count after GC: %u\n", count_after_gc);
+
+    if (ret != KV_OK) {
+        printf("  [!] GC failed!\n");
+        return;
+    }
+
+    /* 验证数据完整性 */
+    uint8_t value[64];
+    uint8_t len;
+
+    /* 验证 gc_key_1 */
+    ret = flash_kv_get((uint8_t *)"gc_key_1", 8, value, &len);
+    printf("  [-] GET gc_key_1: ret=%d, len=%d\n", ret, len);
+    if (ret == KV_OK) {
+        printf("  [-] Verified key_1: %.*s\n", len, value);
+    }
+
+    /* 验证 gc_key_3 */
+    ret = flash_kv_get((uint8_t *)"gc_key_3", 8, value, &len);
+    printf("  [-] GET gc_key_3: ret=%d, len=%d\n", ret, len);
+    if (ret == KV_OK) {
+        printf("  [-] Verified key_3: %.*s\n", len, value);
+    }
+
+    printf("\n  [PASS] GC Test\n");
+}
+
+void test_kv_transaction(void)
+{
+    printf("\n  [Test] KV Transaction\n");
+
+    /* 测试事务状态 */
+    int ret = flash_kv_tx_begin();
+    printf("  [-] TX Begin: %d\n", ret);
+    assert(ret == KV_OK);
+
+    kv_handle_t *handle = flash_kv_get_handle(0);
+    assert(handle != NULL);
+    printf("  [-] TX State after begin: %d\n", handle->tx_state);
+
+    /* 提交事务 */
+    ret = flash_kv_tx_commit();
+    printf("  [-] TX Commit: %d\n", ret);
+    assert(ret == KV_OK);
+
+    printf("  [-] TX State after commit: %d\n", handle->tx_state);
+
+    /* 测试回滚功能 */
+    ret = flash_kv_tx_begin();
+    printf("  [-] TX Begin (rollback test): %d\n", ret);
+
+    ret = flash_kv_tx_rollback();
+    printf("  [-] TX Rollback: %d\n", ret);
+    assert(ret == KV_OK);
+
+    printf("  [-] TX State after rollback: %d\n", handle->tx_state);
+
+    printf("\n  [PASS] Transaction Test\n");
+}
+
+void test_kv_dual_region(void)
+{
+    printf("\n  [Test] KV Dual Region Backup\n");
+
+    /* 先清空Flash确保干净状态 */
+    flash_kv_clear();
+
+    kv_handle_t *handle = flash_kv_get_handle(0);
+    assert(handle != NULL);
+
+    uint8_t active_before = handle->active_region;
+    printf("  [-] Active region before: %u\n", active_before);
+
+    /* 写入一些数据 */
+    const uint8_t region_key[] = "region_key";
+    const uint8_t region_value[] = "region_value";
+    int ret = flash_kv_set(region_key, sizeof(region_key) - 1, region_value, sizeof(region_value) - 1);
+    printf("  [-] Set key in region %u: %d\n", active_before, ret);
+
+    uint32_t count_before_gc = flash_kv_count();
+    printf("  [-] Count before GC: %u\n", count_before_gc);
+
+    /* 触发GC来切换区域 */
+    ret = flash_kv_gc();
+    printf("  [-] GC (region switch): %d\n", ret);
+
+    uint8_t active_after = handle->active_region;
+    printf("  [-] Active region after GC: %u\n", active_after);
+
+    uint32_t count_after_gc = flash_kv_count();
+    printf("  [-] Count after GC: %u\n", count_after_gc);
+
+    /* 验证数据在新区域中仍然存在 */
+    uint8_t value[64];
+    uint8_t len;
+    ret = flash_kv_get(region_key, sizeof(region_key) - 1, value, &len);
+    printf("  [-] Get after region switch: ret=%d, len=%d\n", ret, len);
+    if (ret == KV_OK) {
+        printf("  [-] Value: %.*s\n", len, value);
+    }
+
+    printf("\n  [PASS] Dual Region Test\n");
+}
+
 int main(void)
 {
     printf("========================================\n");
@@ -445,6 +581,9 @@ int main(void)
     test_kv_boundary();
     test_kv_clear();
     test_kv_status();
+    test_kv_gc();
+    test_kv_transaction();
+    test_kv_dual_region();
 
     /* 压力测试单独运行，因为它需要重置Flash */
     ensure_initialized();

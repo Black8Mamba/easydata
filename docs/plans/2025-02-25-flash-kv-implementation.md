@@ -1159,6 +1159,312 @@ git commit -m "test: 运行测试验证通过"
 
 ---
 
+## Task 10: 实现垃圾回收 (GC)
+
+**Files:**
+- Modify: `flash_kv/src/flash_kv_core.c`
+
+**Step 1: 实现 GC 函数**
+
+GC扫描当前区域，复制有效记录到备用区域，然后切换区域。
+
+```c
+/* 垃圾回收 */
+int flash_kv_gc(void)
+{
+    kv_handle_t *handle = &g_handles[0];
+    if (handle->ops == NULL) {
+        return KV_ERR_NO_INIT;
+    }
+
+    uint8_t active = handle->active_region;
+    uint8_t inactive = 1 - active;
+    uint32_t active_addr = handle->region_addr[active];
+    uint32_t inactive_addr = handle->region_addr[inactive];
+
+    /* 擦除备用区域 */
+    handle->ops->erase(inactive_addr, handle->region_size);
+
+    /* 扫描当前区域的有效记录 */
+    uint32_t offset = sizeof(kv_region_header_t);
+    uint32_t written = sizeof(kv_region_header_t);
+    kv_record_t record;
+
+    while (written < handle->region_size - handle->block_size) {
+        if (handle->ops->read(active_addr + offset, (uint8_t *)&record,
+                             sizeof(record)) != 0) {
+            break;
+        }
+
+        /* 检查CRC有效性 */
+        if (kv_record_check_crc(&record) == 0 && record.flags == 1) {
+            /* 复制有效记录到备用区域 */
+            handle->ops->write(inactive_addr + written, (uint8_t *)&record,
+                             sizeof(record));
+            written += sizeof(kv_record_t);
+
+            /* 更新哈希表 */
+            kv_hash_set(&g_hash_table, record.key, record.key_len,
+                       written - sizeof(kv_region_header_t) - inactive_addr);
+        }
+        offset += sizeof(kv_record_t);
+    }
+
+    /* 切换活跃区域 */
+    handle->active_region = inactive;
+    handle->record_count = (written - sizeof(kv_region_header_t)) / sizeof(kv_record_t);
+
+    return KV_OK;
+}
+```
+
+**Step 2: 在 flash_kv_set 中添加 GC 触发**
+
+当空间不足时自动触发GC:
+
+```c
+/* 在 flash_kv_set 函数中，space check 之后添加 */
+if (write_offset >= reserve_offset) {
+    /* 尝试GC */
+    int gc_ret = flash_kv_gc();
+    if (gc_ret != KV_OK) {
+        return KV_ERR_NO_SPACE;
+    }
+    /* 重新计算写入位置 */
+    write_offset = region_addr + sizeof(kv_region_header_t) +
+                  handle->record_count * sizeof(kv_record_t);
+    if (write_offset >= reserve_offset) {
+        return KV_ERR_NO_SPACE;
+    }
+}
+```
+
+**Step 3: Commit**
+
+```bash
+git add flash_kv/src/flash_kv_core.c
+git commit -m "feat: 实现垃圾回收功能"
+```
+
+---
+
+## Task 11: 实现事务支持
+
+**Files:**
+- Modify: `flash_kv/src/flash_kv_core.c`
+
+**Step 1: 添加事务状态变量**
+
+```c
+/* 事务相关变量 - 添加到全局变量区 */
+static kv_record_t g_tx_pending_record = {0};
+static int g_tx_pending = 0;  /* 0: 无挂起, 1: 有挂起记录 */
+```
+
+**Step 2: 实现事务接口**
+
+```c
+/* 事务开始 */
+int flash_kv_tx_begin(void)
+{
+    kv_handle_t *handle = &g_handles[0];
+    if (handle->ops == NULL) {
+        return KV_ERR_NO_INIT;
+    }
+
+    /* 保存当前事务状态 */
+    handle->tx_state = KV_TX_STATE_PREPARED;
+    g_tx_pending = 0;
+    memset(&g_tx_pending_record, 0, sizeof(g_tx_pending_record));
+
+    return KV_OK;
+}
+
+/* 事务提交 */
+int flash_kv_tx_commit(void)
+{
+    kv_handle_t *handle = &g_handles[0];
+
+    if (g_tx_pending) {
+        /* 写入挂起的记录 */
+        uint32_t region_addr = handle->region_addr[handle->active_region];
+        uint32_t write_offset = region_addr + sizeof(kv_region_header_t) +
+                                handle->record_count * sizeof(kv_record_t);
+
+        int ret = kv_record_write(handle, write_offset, &g_tx_pending_record);
+        if (ret != 0) {
+            handle->tx_state = KV_TX_STATE_IDLE;
+            g_tx_pending = 0;
+            return KV_ERR_FLASH_FAIL;
+        }
+
+        /* 更新哈希表 */
+        kv_hash_set(&g_hash_table, g_tx_pending_record.key,
+                   g_tx_pending_record.key_len,
+                   write_offset - region_addr);
+        handle->record_count++;
+        g_tx_pending = 0;
+    }
+
+    handle->tx_state = KV_TX_STATE_COMMITTED;
+    handle->tx_state = KV_TX_STATE_IDLE;
+    return KV_OK;
+}
+
+/* 事务回滚 */
+int flash_kv_tx_rollback(void)
+{
+    kv_handle_t *handle = &g_handles[0];
+    g_tx_pending = 0;
+    memset(&g_tx_pending_record, 0, sizeof(g_tx_pending_record));
+    handle->tx_state = KV_TX_STATE_IDLE;
+    return KV_OK;
+}
+```
+
+**Step 3: Commit**
+
+```bash
+git add flash_kv/src/flash_kv_core.c
+git commit -m "feat: 实现事务支持（begin/commit/rollback）"
+```
+
+---
+
+## Task 12: 实现双区域备份 (A/B)
+
+**Files:**
+- Modify: `flash_kv/src/flash_kv_core.c`
+- Add: `flash_kv/test/test_region_switch.c` (可选测试)
+
+**Step 1: 实现区域恢复和初始化**
+
+```c
+/* 读取区域头部 */
+static int kv_region_header_read(kv_handle_t *handle, uint8_t region,
+                                  kv_region_header_t *header)
+{
+    if (handle->ops->read(handle->region_addr[region],
+                         (uint8_t *)header, sizeof(*header)) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* 验证区域头部有效性 */
+static int kv_region_header_valid(const kv_region_header_t *header)
+{
+    /* 验证魔术字 */
+    if (header->magic != KV_MAGIC && header->magic != KV_MAGIC_B) {
+        return -1;
+    }
+
+    /* 验证CRC */
+    uint32_t crc = kv_crc32((const uint8_t *)header,
+                           sizeof(kv_region_header_t) - 4);
+    if (crc != header->crc32) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/* 初始化区域头部 */
+static int kv_region_header_init(kv_handle_t *handle, uint8_t region)
+{
+    kv_region_header_t header = {0};
+    header.magic = KV_MAGIC;
+    header.version = 1;
+    header.record_count = 0;
+    header.active_offset = sizeof(kv_region_header_t);
+    header.tx_state = KV_TX_STATE_IDLE;
+    header.crc32 = kv_crc32((const uint8_t *)&header,
+                            sizeof(kv_region_header_t) - 4);
+
+    /* 擦除并写入头部 */
+    handle->ops->erase(handle->region_addr[region], handle->region_size);
+    return handle->ops->write(handle->region_addr[region],
+                              (const uint8_t *)&header, sizeof(header));
+}
+```
+
+**Step 2: 修改 flash_kv_init 实现双区域恢复**
+
+```c
+int flash_kv_init(uint8_t instance_id, const kv_instance_config_t *config)
+{
+    /* ... 现有初始化代码 ... */
+
+    /* 读取两个区域的头部 */
+    kv_region_header_t header0, header1;
+    int valid0 = kv_region_header_read(handle, 0, &header0);
+    int valid1 = kv_region_header_read(handle, 1, &header1);
+
+    if (valid0 != 0 && valid1 != 0) {
+        /* 两个区域都无效，需要初始化 */
+        kv_region_header_init(handle, 0);
+        kv_region_header_init(handle, 1);
+        handle->active_region = 0;
+    } else if (valid0 == 0 && valid1 != 0) {
+        /* 只有区域0有效 */
+        handle->active_region = 0;
+    } else if (valid0 != 0 && valid1 == 0) {
+        /* 只有区域1有效 */
+        handle->active_region = 1;
+    } else {
+        /* 两个区域都有效，选择版本号更大的 */
+        if (header1.version >= header0.version) {
+            handle->active_region = 1;
+        } else {
+            handle->active_region = 0;
+        }
+    }
+
+    /* 重建哈希表 */
+    kv_hash_rebuild(handle);
+
+    g_initialized = 1;
+    return KV_OK;
+}
+```
+
+**Step 3: 实现哈希表重建**
+
+```c
+/* 重建哈希表 - 从Flash扫描有效记录 */
+static void kv_hash_rebuild(kv_handle_t *handle)
+{
+    kv_hash_init(&g_hash_table);
+
+    uint32_t region_addr = handle->region_addr[handle->active_region];
+    uint32_t offset = sizeof(kv_region_header_t);
+    kv_record_t record;
+
+    while (offset < handle->region_size - handle->block_size) {
+        if (handle->ops->read(region_addr + offset, (uint8_t *)&record,
+                             sizeof(record)) != 0) {
+            break;
+        }
+
+        if (kv_record_check_crc(&record) == 0 && record.flags == 1) {
+            kv_hash_set(&g_hash_table, record.key, record.key_len,
+                       offset);
+            handle->record_count++;
+        }
+        offset += sizeof(kv_record_t);
+    }
+}
+```
+
+**Step 4: Commit**
+
+```bash
+git add flash_kv/src/flash_kv_core.c
+git commit -m "feat: 实现双区域备份（A/B区域切换和恢复）"
+```
+
+---
+
 ## 总结
 
 本计划包含以下任务：
@@ -1174,5 +1480,8 @@ git commit -m "test: 运行测试验证通过"
 | 7 | 创建单元测试 |
 | 8 | 创建CMake构建文件 |
 | 9 | 运行测试验证 |
+| 10 | 实现垃圾回收 (GC) |
+| 11 | 实现事务支持 |
+| 12 | 实现双区域备份 (A/B) |
 
 每个任务都是独立的，可以按顺序实现和测试。

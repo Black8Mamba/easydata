@@ -78,9 +78,10 @@ typedef struct kv_handle {
 typedef struct {
     uint8_t key[FLASH_KV_KEY_SIZE];
     uint8_t value[FLASH_KV_VALUE_SIZE];
-    uint8_t value_len;    /* 实际value长度 */
-    uint8_t flags;        /* bit0: valid, bit1: deleted */
-    uint8_t reserved[2];
+    uint8_t key_len;     /* 实际key长度 */
+    uint8_t value_len;   /* 实际value长度 */
+    uint8_t flags;       /* bit0: valid, bit1: deleted */
+    uint8_t reserved[1];
     uint16_t crc16;
 } __attribute__((packed)) kv_record_t;
 
