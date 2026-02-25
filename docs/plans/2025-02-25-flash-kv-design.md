@@ -51,8 +51,154 @@ flash_kv/
 │   ├── flash_kv_core.c    # 核心实现
 │   ├── flash_kv_adapter.c # 适配层默认实现(可选)
 │   └── flash_kv_utils.c   # 类型转换辅助函数
+├── test/
+│   ├── flash_kv_test.c    # 单元测试
+│   └── mock_flash.c      # 模拟Flash驱动(内存模拟)
+├── adapter/
+│   ├── stm32_flash.c     # STM32 Flash适配
+│   ├── esp32_flash.c    # ESP32 Flash适配
+│   └── linux_mem_flash.c # Linux内存模拟适配(用于测试)
 └── doc/
     └── flash_kv_design.md # 设计文档
+```
+
+### 1.4 测试支持
+
+为提高代码可测试性，支持多平台测试：
+
+#### Linux内存模拟Flash
+
+```c
+/* linux_mem_flash.c - 使用内存模拟Flash */
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+
+typedef struct {
+    uint8_t *memory;        /* 模拟Flash的内存 */
+    uint32_t size;          /* 模拟Flash大小 */
+    uint32_t block_size;   /* 块大小 */
+    uint32_t *block_map;   /* 块擦除状态位图 */
+} mem_flash_t;
+
+static mem_flash_t g_flash = {0};
+
+/**
+ * @brief 初始化模拟Flash
+ */
+int mem_flash_init(uint32_t size, uint32_t block_size) {
+    g_flash.memory = calloc(size, 1);
+    g_flash.size = size;
+    g_flash.block_size = block_size;
+    g_flash.block_map = calloc(size / block_size, sizeof(uint32_t));
+    return 0;
+}
+
+int mem_flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
+    if (addr + len > g_flash.size) return -1;
+    memcpy(buf, g_flash.memory + addr, len);
+    return 0;
+}
+
+int mem_flash_write(uint32_t addr, const uint8_t *buf, uint32_t len) {
+    if (addr + len > g_flash.size) return -1;
+    /* 模拟Flash写入: 只能将1写成0，不能将0写成1 */
+    for (uint32_t i = 0; i < len; i++) {
+        g_flash.memory[addr + i] &= buf[i];
+    }
+    return 0;
+}
+
+int mem_flash_erase(uint32_t addr, uint32_t len) {
+    /* 按块擦除 */
+    uint32_t block_start = addr / g_flash.block_size;
+    uint32_t block_end = (addr + len + g_flash.block_size - 1) / g_flash.block_size;
+
+    for (uint32_t i = block_start; i < block_end; i++) {
+        memset(g_flash.memory + i * g_flash.block_size, 0xFF, g_flash.block_size);
+        g_flash.block_map[i] = 1;
+    }
+    return 0;
+}
+
+/* 模拟Flash操作接口 */
+static const flash_kv_ops_t mem_flash_ops = {
+    .init   = mem_flash_init,
+    .read   = mem_flash_read,
+    .write  = mem_flash_write,
+    .erase  = mem_flash_erase,
+};
+```
+
+#### 单元测试示例
+
+```c
+/* flash_kv_test.c */
+#include <stdio.h>
+#include <assert.h>
+
+void test_kv_set_get(void) {
+    /* 初始化模拟Flash */
+    mem_flash_init(64 * 1024, 2048);
+
+    /* 注册适配器 */
+    flash_kv_adapter_register(&mem_flash_ops);
+
+    /* 初始化KV */
+    kv_instance_config_t config = {
+        .start_addr = 0,
+        .total_size = 64 * 1024,
+        .block_size = 2048,
+    };
+    flash_kv_init(0, &config);
+
+    /* 测试写入/读取 */
+    uint8_t value[64] = "test_value";
+    int ret = flash_kv_set((uint8_t*)"key1", 4, value, 9);
+    assert(ret == KV_OK);
+
+    uint8_t read_val[64];
+    uint8_t len = sizeof(read_val);
+    ret = flash_kv_get((uint8_t*)"key1", 4, read_val, &len);
+    assert(ret == KV_OK);
+    assert(len == 9);
+    assert(memcmp(read_val, value, 9) == 0);
+
+    printf("test_kv_set_get PASSED\n");
+}
+
+void test_kv_update(void) {
+    /* 测试更新同一个Key */
+    // ...
+}
+
+void test_kv_gc(void) {
+    /* 测试GC功能 */
+    // ...
+}
+
+int main(void) {
+    test_kv_set_get();
+    test_kv_update();
+    test_kv_gc();
+    printf("All tests PASSED\n");
+    return 0;
+}
+```
+
+#### 测试编译运行
+
+```bash
+# 编译测试
+gcc -o flash_kv_test \
+    test/flash_kv_test.c \
+    src/flash_kv_core.c \
+    src/flash_kv_utils.c \
+    test/mock_flash.c \
+    -Iinc -Wall
+
+# 运行测试
+./flash_kv_test
 ```
 
 ---
