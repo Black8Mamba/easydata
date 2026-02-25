@@ -1,3 +1,12 @@
+/**
+ * @file flash_kv_utils.c
+ * @brief 类型转换辅助函数实现
+ * @description 提供常用数据类型(u8/i8/u16/u32/float/double/bool)与字节数组的相互转换
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #include <string.h>
 #include "flash_kv_utils.h"
 

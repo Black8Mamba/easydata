@@ -1,3 +1,12 @@
+/**
+ * @file flash_kv_hash.h
+ * @brief 哈希表接口头文件
+ * @description 哈希表操作接口声明
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #ifndef FLASH_KV_HASH_H
 #define FLASH_KV_HASH_H
 

@@ -1,3 +1,12 @@
+/**
+ * @file flash_kv_hash.c
+ * @brief 哈希表实现
+ * @description 使用DJB2哈希函数和开放地址法实现O(1)查找的哈希表
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #include <string.h>
 #include "flash_kv_hash.h"
 

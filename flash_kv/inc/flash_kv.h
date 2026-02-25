@@ -1,3 +1,12 @@
+/**
+ * @file flash_kv.h
+ * @brief Flash KV 主头文件
+ * @description 对外API接口声明，包含初始化、基本操作、事务、GC等
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #ifndef FLASH_KV_H
 #define FLASH_KV_H
 

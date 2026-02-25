@@ -1,3 +1,16 @@
+/**
+ * @file flash_kv_core.c
+ * @brief Flash KV 核心实现
+ * @description 提供基于Flash的Key-Value存储核心功能，包括:
+ *             - 基本的KV操作 (set/get/del/exists)
+ *             - 垃圾回收 (GC)
+ *             - 事务支持 (begin/commit/rollback)
+ *             - 双区域备份 (A/B区域切换)
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #include <string.h>
 #include <stdio.h>
 #include "flash_kv.h"

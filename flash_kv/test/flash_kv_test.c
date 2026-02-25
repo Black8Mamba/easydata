@@ -1,3 +1,12 @@
+/**
+ * @file flash_kv_test.c
+ * @brief Flash KV 单元测试
+ * @description 包含12个测试用例，覆盖基础操作、类型转换、GC、事务、双区域备份等功能
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>

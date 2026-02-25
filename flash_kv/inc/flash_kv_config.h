@@ -1,3 +1,12 @@
+/**
+ * @file flash_kv_config.h
+ * @brief Flash KV 配置头文件
+ * @description 定义Flash硬件参数和KV存储配置，需根据具体MCU修改
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #ifndef FLASH_KV_CONFIG_H
 #define FLASH_KV_CONFIG_H
 

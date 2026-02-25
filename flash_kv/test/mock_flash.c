@@ -1,3 +1,12 @@
+/**
+ * @file mock_flash.c
+ * @brief 模拟Flash驱动 (用于测试)
+ * @description 使用内存模拟Flash行为，支持Linux平台单元测试
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

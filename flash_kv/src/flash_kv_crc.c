@@ -1,3 +1,12 @@
+/**
+ * @file flash_kv_crc.c
+ * @brief CRC 校验实现
+ * @description 提供CRC-16和CRC-32校验算法，用于数据完整性验证
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #include "flash_kv_crc.h"
 
 /* CRC-16-CCITT 计算 */

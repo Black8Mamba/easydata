@@ -1,3 +1,12 @@
+/**
+ * @file flash_kv_types.h
+ * @brief Flash KV 类型定义头文件
+ * @description 定义错误码、Flash操作接口、结构体等核心数据类型
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #ifndef FLASH_KV_TYPES_H
 #define FLASH_KV_TYPES_H
 

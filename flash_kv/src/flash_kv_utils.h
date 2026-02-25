@@ -1,3 +1,12 @@
+/**
+ * @file flash_kv_utils.h
+ * @brief 工具函数头文件
+ * @description 字节序转换和类型序列化工具函数声明
+ * @author EasyData
+ * @date 2026-02-25
+ * @version 1.0.0
+ */
+
 #ifndef FLASH_KV_UTILS_H
 #define FLASH_KV_UTILS_H
 
