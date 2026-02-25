@@ -15,6 +15,11 @@ static mem_flash_t g_flash = {0};
 
 static int mem_flash_init(void)
 {
+    /* 如果已初始化，直接返回 */
+    if (g_flash.memory != NULL) {
+        return 0;
+    }
+
     g_flash.size = 64 * 1024;  /* 64KB for testing */
     g_flash.block_size = FLASH_KV_BLOCK_SIZE;
     g_flash.memory = malloc(g_flash.size);
@@ -23,6 +28,15 @@ static int mem_flash_init(void)
     }
     /* 初始化为0xFF，模拟未使用的Flash */
     memset(g_flash.memory, 0xFF, g_flash.size);
+    return 0;
+}
+
+/* 重置Flash（用于测试重新开始） */
+static int mem_flash_reset(void)
+{
+    if (g_flash.memory != NULL) {
+        memset(g_flash.memory, 0xFF, g_flash.size);
+    }
     return 0;
 }
 
@@ -64,3 +78,9 @@ const flash_kv_ops_t mock_flash_ops = {
     .write  = mem_flash_write,
     .erase  = mem_flash_erase,
 };
+
+/* 导出的reset函数供测试使用 */
+int mock_flash_reset(void)
+{
+    return mem_flash_reset();
+}
