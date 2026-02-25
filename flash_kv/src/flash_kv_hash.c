@@ -78,6 +78,7 @@ int kv_hash_del(kv_hash_table_t *table, const uint8_t *key, uint8_t key_len)
 
         if (slot->key_len == key_len && memcmp(slot->key, key, key_len) == 0) {
             slot->key_len = 0;
+            memset(slot->key, 0, FLASH_KV_KEY_SIZE);  /* 清除key数据 */
             table->count--;
             return 0;
         }

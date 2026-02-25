@@ -105,6 +105,22 @@ int flash_kv_set(const uint8_t *key, uint8_t key_len,
         return KV_ERR_NO_INIT;
     }
 
+    /* 检查key是否已存在，如存在则标记旧记录为已删除 */
+    uint32_t old_offset;
+    if (kv_hash_get(&g_hash_table, key, key_len, &old_offset) == 0) {
+        /* 读取旧记录并标记为已删除 */
+        uint32_t region_addr = handle->region_addr[handle->active_region];
+        kv_record_t old_record;
+        if (handle->ops->read(region_addr + old_offset, (uint8_t *)&old_record,
+                             sizeof(old_record)) == 0) {
+            old_record.flags = 2;  /* DELETED */
+            old_record.crc16 = kv_crc16((const uint8_t *)&old_record,
+                                        sizeof(kv_record_t) - 2);
+            handle->ops->write(region_addr + old_offset, (const uint8_t *)&old_record,
+                             sizeof(old_record));
+        }
+    }
+
     /* 检查空间 */
     uint32_t region_addr = handle->region_addr[handle->active_region];
     uint32_t reserve_offset = region_addr + handle->region_size - handle->block_size;
@@ -120,6 +136,7 @@ int flash_kv_set(const uint8_t *key, uint8_t key_len,
     memset(&record, 0, sizeof(record));
     memcpy(record.key, key, key_len);
     memcpy(record.value, value, value_len);
+    record.value_len = value_len;
     record.flags = 1;  /* VALID */
 
     /* 写入 */
@@ -169,8 +186,8 @@ int flash_kv_get(const uint8_t *key, uint8_t key_len,
     }
 
     /* 复制value */
-    memcpy(value, record.value, FLASH_KV_VALUE_SIZE);
-    *value_len = FLASH_KV_VALUE_SIZE;
+    memcpy(value, record.value, record.value_len);
+    *value_len = record.value_len;
 
     return KV_OK;
 }
@@ -187,10 +204,28 @@ int flash_kv_del(const uint8_t *key, uint8_t key_len)
         return KV_ERR_NO_INIT;
     }
 
-    /* 从哈希表删除 */
-    if (kv_hash_del(&g_hash_table, key, key_len) != 0) {
+    /* 先获取Flash中的偏移量，然后从哈希表删除 */
+    uint32_t offset;
+    if (kv_hash_get(&g_hash_table, key, key_len, &offset) != 0) {
         return KV_ERR_NOT_FOUND;
     }
+
+    /* 读取旧记录并标记为已删除 */
+    uint32_t region_addr = handle->region_addr[handle->active_region];
+    kv_record_t record;
+    if (handle->ops->read(region_addr + offset, (uint8_t *)&record,
+                         sizeof(record)) == 0) {
+        /* 标记为已删除 */
+        record.flags = 2;  /* DELETED */
+        record.crc16 = kv_crc16((const uint8_t *)&record,
+                                sizeof(kv_record_t) - 2);
+        handle->ops->write(region_addr + offset, (const uint8_t *)&record,
+                         sizeof(record));
+    }
+
+    /* 从哈希表删除 */
+    kv_hash_del(&g_hash_table, key, key_len);
+    handle->record_count--;
 
     return KV_OK;
 }
@@ -243,8 +278,18 @@ int flash_kv_foreach(kv_foreach_cb callback, void *user_data)
 
 int flash_kv_clear(void)
 {
+    kv_handle_t *handle = &g_handles[0];
+
+    /* 擦除当前活跃区域 */
+    if (handle->ops && handle->ops->erase) {
+        handle->ops->erase(handle->region_addr[handle->active_region],
+                          handle->region_size);
+    }
+
+    /* 清除内存中的哈希表和计数 */
     kv_hash_init(&g_hash_table);
-    g_handles[0].record_count = 0;
+    handle->record_count = 0;
+
     return KV_OK;
 }
 
