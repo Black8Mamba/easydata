@@ -8,10 +8,11 @@
  *             - 双区域备份 (A/B区域切换)
  * @author EasyData
  * @date 2026-02-25
- * @version 1.0.0
+ * @version 1.1.0
  */
 
 #include <string.h>
+#include <stddef.h>
 #include <stdio.h>
 #include "flash_kv.h"
 #include "flash_kv_hash.h"
@@ -24,11 +25,22 @@ static const flash_kv_ops_t *g_flash_ops = NULL;
 static uint8_t g_initialized = 0;
 
 /* 事务相关变量 */
-static kv_record_t g_tx_pending_record = {0};
-static uint8_t g_tx_pending = 0;  /* 0: 无挂起, 1: 有挂起记录 */
+typedef struct {
+    kv_record_t record;
+    uint8_t is_delete;  /* 1=删除操作, 0=写入操作 */
+} kv_tx_entry_t;
+
+static kv_tx_entry_t g_tx_buffer[FLASH_KV_TX_MAX_RECORDS];
+static uint8_t g_tx_count = 0;
+static uint8_t g_tx_active = 0;  /* 0: 无事务, 1: 事务进行中 */
 
 /* 前向声明 */
 static void kv_hash_rebuild(kv_handle_t *handle);
+static int kv_region_header_write(kv_handle_t *handle, uint8_t region);
+
+/*============================================================================
+ * 区域头部操作
+ *============================================================================*/
 
 /* 读取区域头部 */
 static int kv_region_header_read(kv_handle_t *handle, uint8_t region,
@@ -44,12 +56,10 @@ static int kv_region_header_read(kv_handle_t *handle, uint8_t region,
 /* 验证区域头部有效性 */
 static int kv_region_header_valid(const kv_region_header_t *header)
 {
-    /* 验证魔术字 */
     if (header->magic != KV_MAGIC && header->magic != KV_MAGIC_B) {
         return -1;
     }
 
-    /* 验证CRC */
     uint32_t crc = kv_crc32((const uint8_t *)header,
                            sizeof(kv_region_header_t) - 4);
     if (crc != header->crc32) {
@@ -59,27 +69,42 @@ static int kv_region_header_valid(const kv_region_header_t *header)
     return 0;
 }
 
-/* 初始化区域头部 */
-static int kv_region_header_init(kv_handle_t *handle, uint8_t region)
+/* 写入区域头部到Flash (要求该位置已被擦除或可覆写) */
+static int kv_region_header_write(kv_handle_t *handle, uint8_t region)
 {
-    kv_region_header_t header = {0};
-    header.magic = KV_MAGIC;
-    header.version = 1;
-    header.record_count = 0;
-    header.active_offset = sizeof(kv_region_header_t);
-    header.tx_state = KV_TX_STATE_IDLE;
+    kv_region_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.magic = (region == 0) ? KV_MAGIC : KV_MAGIC_B;
+    header.version = handle->version;
+    header.record_count = handle->record_count;
+    header.active_offset = handle->active_offset;
+    header.tx_state = (uint8_t)handle->tx_state;
     header.crc32 = kv_crc32((const uint8_t *)&header,
                             sizeof(kv_region_header_t) - 4);
 
-    /* 擦除并写入头部 */
-    if (handle->ops->erase(handle->region_addr[region], handle->region_size) != 0) {
-        return -1;
-    }
     return handle->ops->write(handle->region_addr[region],
                              (const uint8_t *)&header, sizeof(header));
 }
 
-/* 初始化Flash适配器 */
+/* 初始化区域 (擦除 + 写头部) */
+static int kv_region_format(kv_handle_t *handle, uint8_t region)
+{
+    if (handle->ops->erase(handle->region_addr[region], handle->region_size) != 0) {
+        return -1;
+    }
+
+    handle->version = 1;
+    handle->record_count = 0;
+    handle->active_offset = sizeof(kv_region_header_t);
+    handle->tx_state = KV_TX_STATE_IDLE;
+
+    return kv_region_header_write(handle, region);
+}
+
+/*============================================================================
+ * 适配器注册
+ *============================================================================*/
+
 int flash_kv_adapter_register(const flash_kv_ops_t *ops)
 {
     if (ops == NULL || ops->init == NULL || ops->read == NULL ||
@@ -95,7 +120,10 @@ const flash_kv_ops_t* flash_kv_adapter_get(void)
     return g_flash_ops;
 }
 
-/* 初始化KV存储 */
+/*============================================================================
+ * 初始化
+ *============================================================================*/
+
 int flash_kv_init(uint8_t instance_id, const kv_instance_config_t *config)
 {
     if (instance_id >= FLASH_KV_INSTANCE_MAX || config == NULL) {
@@ -117,56 +145,53 @@ int flash_kv_init(uint8_t instance_id, const kv_instance_config_t *config)
     handle->region_addr[1] = config->start_addr + handle->region_size;
     handle->active_region = 0;
     handle->version = 1;
+    handle->active_offset = sizeof(kv_region_header_t);
 
-    /* 双区域恢复：读取两个区域的头部 */
+    /* 读取两个区域的头部 */
     kv_region_header_t header0, header1;
-    int valid0 = kv_region_header_read(handle, 0, &header0);
-    int valid1 = kv_region_header_read(handle, 1, &header1);
+    int read0 = kv_region_header_read(handle, 0, &header0);
+    int read1 = kv_region_header_read(handle, 1, &header1);
 
-    /* 检查区域有效性 */
-    if (valid0 == 0 && kv_region_header_valid(&header0) == 0) {
-        /* 区域0有效 */
-    } else {
-        /* 区域0无效，初始化 */
-        kv_region_header_init(handle, 0);
-    }
+    int valid0 = (read0 == 0 && kv_region_header_valid(&header0) == 0);
+    int valid1 = (read1 == 0 && kv_region_header_valid(&header1) == 0);
 
-    if (valid1 == 0 && kv_region_header_valid(&header1) == 0) {
-        /* 区域1有效 */
-    } else {
-        /* 区域1无效，初始化 */
-        kv_region_header_init(handle, 1);
-    }
-
-    /* 重新读取有效区域，选择版本号更大的 */
-    kv_region_header_read(handle, 0, &header0);
-    kv_region_header_read(handle, 1, &header1);
-
-    int valid0_new = (kv_region_header_valid(&header0) == 0);
-    int valid1_new = (kv_region_header_valid(&header1) == 0);
-
-    if (valid0_new && valid1_new) {
+    if (valid0 && valid1) {
         /* 两个区域都有效，选择版本号更大的 */
-        if (header1.version >= header0.version) {
+        if (header1.version > header0.version) {
             handle->active_region = 1;
             handle->version = header1.version;
         } else {
             handle->active_region = 0;
             handle->version = header0.version;
         }
-    } else if (valid0_new) {
+    } else if (valid0) {
         handle->active_region = 0;
         handle->version = header0.version;
-    } else if (valid1_new) {
+    } else if (valid1) {
         handle->active_region = 1;
         handle->version = header1.version;
     } else {
-        /* 两个区域都无效，使用默认 */
+        /* 两个区域都无效，格式化区域0 */
+        kv_region_format(handle, 0);
         handle->active_region = 0;
     }
 
-    /* 重建哈希表 */
+    /* 断电恢复: 检查事务状态 */
+    if (valid0 || valid1) {
+        kv_region_header_t *active_header =
+            (handle->active_region == 0) ? &header0 : &header1;
+        if (active_header->tx_state == KV_TX_STATE_PREPARED) {
+            /* 上次有未完成的事务, rebuild会自然跳过无效记录 */
+        }
+    }
+
+    /* 重建哈希表 (扫描Flash恢复内存索引) */
     kv_hash_rebuild(handle);
+
+    /* 重置事务状态 */
+    handle->tx_state = KV_TX_STATE_IDLE;
+    g_tx_active = 0;
+    g_tx_count = 0;
 
     g_initialized = 1;
     return KV_OK;
@@ -189,6 +214,10 @@ int flash_kv_deinit(uint8_t instance_id)
     return KV_OK;
 }
 
+/*============================================================================
+ * 记录操作
+ *============================================================================*/
+
 /* 验证记录CRC */
 static int kv_record_check_crc(const kv_record_t *record)
 {
@@ -197,41 +226,87 @@ static int kv_record_check_crc(const kv_record_t *record)
     return (crc == record->crc16) ? 0 : -1;
 }
 
-/* 重建哈希表 - 从Flash扫描有效记录 */
+/* 重建哈希表 - 从Flash扫描有效记录, 同时确定active_offset */
 static void kv_hash_rebuild(kv_handle_t *handle)
 {
     kv_hash_init(&g_hash_table);
+    handle->record_count = 0;
 
     uint32_t region_addr = handle->region_addr[handle->active_region];
     uint32_t offset = sizeof(kv_region_header_t);
+    uint32_t max_offset = handle->region_size - handle->block_size;
     kv_record_t record;
 
-    while (offset < handle->region_size - handle->block_size) {
+    while (offset + sizeof(kv_record_t) <= max_offset) {
         if (handle->ops->read(region_addr + offset, (uint8_t *)&record,
                              sizeof(record)) != 0) {
             break;
         }
 
-        if (kv_record_check_crc(&record) == 0 && record.flags == 1) {
-            kv_hash_set(&g_hash_table, record.key, record.key_len,
-                       offset);
-            handle->record_count++;
+        /* 如果flags是擦除态, 说明后面没有更多记录 */
+        if (record.flags == KV_FLAG_ERASED) {
+            break;
         }
+
+        if (record.flags == KV_FLAG_VALID && kv_record_check_crc(&record) == 0) {
+            /* 有效记录: 加入哈希表 (后面的同key会覆盖前面的) */
+            uint32_t existing_offset;
+            if (kv_hash_get(&g_hash_table, record.key, record.key_len,
+                           &existing_offset) == 0) {
+                /* key已存在, 更新 (不增加计数) */
+                kv_hash_set(&g_hash_table, record.key, record.key_len, offset);
+            } else {
+                /* 新key */
+                kv_hash_set(&g_hash_table, record.key, record.key_len, offset);
+                handle->record_count++;
+            }
+        } else if (record.flags == KV_FLAG_DELETED) {
+            /* 已删除的记录: 如果哈希表中有对应key, 移除 */
+            uint32_t existing_offset;
+            if (kv_hash_get(&g_hash_table, record.key, record.key_len,
+                           &existing_offset) == 0) {
+                kv_hash_del(&g_hash_table, record.key, record.key_len);
+                handle->record_count--;
+            }
+        }
+        /* CRC失败的记录跳过 */
+
         offset += sizeof(kv_record_t);
     }
+
+    handle->active_offset = offset;
 }
 
-/* 写入记录 */
-static int kv_record_write(kv_handle_t *handle, uint32_t offset,
+/* 写入记录到Flash (计算CRC后写入) */
+static int kv_record_write(kv_handle_t *handle, uint32_t abs_addr,
                           const kv_record_t *record)
 {
     kv_record_t r = *record;
-    r.crc16 = kv_crc16((const uint8_t *)&r,
-                       sizeof(kv_record_t) - 2);
-    return handle->ops->write(offset, (const uint8_t *)&r, sizeof(r));
+    r.crc16 = kv_crc16((const uint8_t *)&r, sizeof(kv_record_t) - 2);
+    return handle->ops->write(abs_addr, (const uint8_t *)&r, sizeof(r));
 }
 
-/* KV设置 */
+/* 标记记录为已删除 (只清零flags中的bit, Flash兼容) */
+static int kv_record_mark_deleted(kv_handle_t *handle, uint32_t rel_offset)
+{
+    uint32_t region_addr = handle->region_addr[handle->active_region];
+    uint32_t flags_addr = region_addr + rel_offset +
+                          offsetof(kv_record_t, flags);
+
+    /*
+     * 写入KV_FLAG_DELETED(0xFC)到flags位置
+     * Flash AND运算: 原值0xFE & 写入0xFC = 0xFC
+     * bit0: 0 & 0 = 0 (不变)
+     * bit1: 1 & 0 = 0 (从1变0, Flash允许)
+     */
+    uint8_t del_flag = KV_FLAG_DELETED;
+    return handle->ops->write(flags_addr, &del_flag, 1);
+}
+
+/*============================================================================
+ * 基本KV操作
+ *============================================================================*/
+
 int flash_kv_set(const uint8_t *key, uint8_t key_len,
                  const uint8_t *value, uint8_t value_len)
 {
@@ -245,66 +320,76 @@ int flash_kv_set(const uint8_t *key, uint8_t key_len,
         return KV_ERR_NO_INIT;
     }
 
-    /* 检查key是否已存在，如存在则标记旧记录为已删除 */
-    uint32_t old_offset;
-    if (kv_hash_get(&g_hash_table, key, key_len, &old_offset) == 0) {
-        /* 读取旧记录并标记为已删除 */
-        uint32_t region_addr = handle->region_addr[handle->active_region];
-        kv_record_t old_record;
-        if (handle->ops->read(region_addr + old_offset, (uint8_t *)&old_record,
-                             sizeof(old_record)) == 0) {
-            old_record.flags = 2;  /* DELETED */
-            old_record.crc16 = kv_crc16((const uint8_t *)&old_record,
-                                        sizeof(kv_record_t) - 2);
-            handle->ops->write(region_addr + old_offset, (const uint8_t *)&old_record,
-                             sizeof(old_record));
+    /* 如果在事务中, 缓存到事务缓冲区 */
+    if (g_tx_active) {
+        if (g_tx_count >= FLASH_KV_TX_MAX_RECORDS) {
+            return KV_ERR_NO_SPACE;
         }
+        kv_tx_entry_t *entry = &g_tx_buffer[g_tx_count];
+        memset(&entry->record, 0, sizeof(kv_record_t));
+        memcpy(entry->record.key, key, key_len);
+        memcpy(entry->record.value, value, value_len);
+        entry->record.key_len = key_len;
+        entry->record.value_len = value_len;
+        entry->record.flags = KV_FLAG_VALID;
+        entry->is_delete = 0;
+        g_tx_count++;
+        return KV_OK;
     }
 
-    /* 检查空间 */
-    uint32_t region_addr = handle->region_addr[handle->active_region];
-    uint32_t reserve_offset = region_addr + handle->region_size - handle->block_size;
-    uint32_t write_offset = region_addr + sizeof(kv_region_header_t) +
-                            handle->record_count * sizeof(kv_record_t);
+    /* 检查key是否已存在 */
+    uint32_t old_offset;
+    int key_exists = (kv_hash_get(&g_hash_table, key, key_len, &old_offset) == 0);
 
-    if (write_offset >= reserve_offset) {
+    /* 检查空间 */
+    uint32_t max_offset = handle->region_size - handle->block_size;
+
+    if (handle->active_offset + sizeof(kv_record_t) > max_offset) {
         /* 空间不足，尝试GC */
         int gc_ret = flash_kv_gc();
         if (gc_ret != KV_OK) {
             return KV_ERR_NO_SPACE;
         }
-        /* 重新计算写入位置 */
-        write_offset = region_addr + sizeof(kv_region_header_t) +
-                      handle->record_count * sizeof(kv_record_t);
-        if (write_offset >= reserve_offset) {
+        /* GC后检查空间 */
+        if (handle->active_offset + sizeof(kv_record_t) > max_offset) {
             return KV_ERR_NO_SPACE;
         }
     }
 
-    /* 构造记录 */
+    /* 如果key已存在, 标记旧记录为已删除 */
+    if (key_exists) {
+        kv_record_mark_deleted(handle, old_offset);
+    }
+
+    /* 构造新记录 */
     kv_record_t record;
     memset(&record, 0, sizeof(record));
     memcpy(record.key, key, key_len);
     memcpy(record.value, value, value_len);
     record.key_len = key_len;
     record.value_len = value_len;
-    record.flags = 1;  /* VALID */
+    record.flags = KV_FLAG_VALID;
 
-    /* 写入 */
-    int ret = kv_record_write(handle, write_offset, &record);
+    /* 写入新记录 */
+    uint32_t region_addr = handle->region_addr[handle->active_region];
+    uint32_t write_addr = region_addr + handle->active_offset;
+    int ret = kv_record_write(handle, write_addr, &record);
     if (ret != 0) {
         return KV_ERR_FLASH_FAIL;
     }
 
     /* 更新哈希表 */
-    kv_hash_set(&g_hash_table, key, key_len,
-                write_offset - region_addr);
+    kv_hash_set(&g_hash_table, key, key_len, handle->active_offset);
 
-    handle->record_count++;
+    /* 更新内存状态 */
+    if (!key_exists) {
+        handle->record_count++;
+    }
+    handle->active_offset += sizeof(kv_record_t);
+
     return KV_OK;
 }
 
-/* KV获取 */
 int flash_kv_get(const uint8_t *key, uint8_t key_len,
                  uint8_t *value, uint8_t *value_len)
 {
@@ -315,6 +400,23 @@ int flash_kv_get(const uint8_t *key, uint8_t key_len,
     kv_handle_t *handle = &g_handles[0];
     if (handle->ops == NULL) {
         return KV_ERR_NO_INIT;
+    }
+
+    /* 如果在事务中, 先查缓冲区 (后面的覆盖前面的) */
+    if (g_tx_active) {
+        for (int i = g_tx_count - 1; i >= 0; i--) {
+            kv_tx_entry_t *entry = &g_tx_buffer[i];
+            if (entry->record.key_len == key_len &&
+                memcmp(entry->record.key, key, key_len) == 0) {
+                if (entry->is_delete) {
+                    return KV_ERR_NOT_FOUND;
+                }
+                memset(value, 0, *value_len);
+                memcpy(value, entry->record.value, entry->record.value_len);
+                *value_len = entry->record.value_len;
+                return KV_OK;
+            }
+        }
     }
 
     /* 查找哈希表 */
@@ -336,7 +438,7 @@ int flash_kv_get(const uint8_t *key, uint8_t key_len,
         return KV_ERR_CRC_FAIL;
     }
 
-    /* 复制value - 先清零缓冲区防止乱码 */
+    /* 复制value */
     memset(value, 0, FLASH_KV_VALUE_SIZE);
     memcpy(value, record.value, record.value_len);
     *value_len = record.value_len;
@@ -344,10 +446,9 @@ int flash_kv_get(const uint8_t *key, uint8_t key_len,
     return KV_OK;
 }
 
-/* KV删除 */
 int flash_kv_del(const uint8_t *key, uint8_t key_len)
 {
-    if (key == NULL) {
+    if (key == NULL || key_len == 0) {
         return KV_ERR_INVALID_PARAM;
     }
 
@@ -356,24 +457,28 @@ int flash_kv_del(const uint8_t *key, uint8_t key_len)
         return KV_ERR_NO_INIT;
     }
 
-    /* 先获取Flash中的偏移量，然后从哈希表删除 */
+    /* 如果在事务中, 缓存删除操作 */
+    if (g_tx_active) {
+        if (g_tx_count >= FLASH_KV_TX_MAX_RECORDS) {
+            return KV_ERR_NO_SPACE;
+        }
+        kv_tx_entry_t *entry = &g_tx_buffer[g_tx_count];
+        memset(&entry->record, 0, sizeof(kv_record_t));
+        memcpy(entry->record.key, key, key_len);
+        entry->record.key_len = key_len;
+        entry->is_delete = 1;
+        g_tx_count++;
+        return KV_OK;
+    }
+
+    /* 查找哈希表获取Flash偏移量 */
     uint32_t offset;
     if (kv_hash_get(&g_hash_table, key, key_len, &offset) != 0) {
         return KV_ERR_NOT_FOUND;
     }
 
-    /* 读取旧记录并标记为已删除 */
-    uint32_t region_addr = handle->region_addr[handle->active_region];
-    kv_record_t record;
-    if (handle->ops->read(region_addr + offset, (uint8_t *)&record,
-                         sizeof(record)) == 0) {
-        /* 标记为已删除 */
-        record.flags = 2;  /* DELETED */
-        record.crc16 = kv_crc16((const uint8_t *)&record,
-                                sizeof(kv_record_t) - 2);
-        handle->ops->write(region_addr + offset, (const uint8_t *)&record,
-                         sizeof(record));
-    }
+    /* 标记记录为已删除 (Flash兼容: 只清零bit) */
+    kv_record_mark_deleted(handle, offset);
 
     /* 从哈希表删除 */
     kv_hash_del(&g_hash_table, key, key_len);
@@ -382,14 +487,16 @@ int flash_kv_del(const uint8_t *key, uint8_t key_len)
     return KV_OK;
 }
 
-/* KV是否存在 */
 bool flash_kv_exists(const uint8_t *key, uint8_t key_len)
 {
     uint32_t offset;
     return (kv_hash_get(&g_hash_table, key, key_len, &offset) == 0);
 }
 
-/* 事务接口 */
+/*============================================================================
+ * 事务接口
+ *============================================================================*/
+
 int flash_kv_tx_begin(void)
 {
     kv_handle_t *handle = &g_handles[0];
@@ -397,10 +504,13 @@ int flash_kv_tx_begin(void)
         return KV_ERR_NO_INIT;
     }
 
-    /* 保存当前事务状态 */
+    if (g_tx_active) {
+        return KV_ERR_TRANSACTION;
+    }
+
     handle->tx_state = KV_TX_STATE_PREPARED;
-    g_tx_pending = 0;
-    memset(&g_tx_pending_record, 0, sizeof(g_tx_pending_record));
+    g_tx_active = 1;
+    g_tx_count = 0;
 
     return KV_OK;
 }
@@ -408,43 +518,53 @@ int flash_kv_tx_begin(void)
 int flash_kv_tx_commit(void)
 {
     kv_handle_t *handle = &g_handles[0];
-
-    if (g_tx_pending) {
-        /* 写入挂起的记录 */
-        uint32_t region_addr = handle->region_addr[handle->active_region];
-        uint32_t write_offset = region_addr + sizeof(kv_region_header_t) +
-                                handle->record_count * sizeof(kv_record_t);
-
-        int ret = kv_record_write(handle, write_offset, &g_tx_pending_record);
-        if (ret != 0) {
-            handle->tx_state = KV_TX_STATE_IDLE;
-            g_tx_pending = 0;
-            return KV_ERR_FLASH_FAIL;
-        }
-
-        /* 更新哈希表 */
-        kv_hash_set(&g_hash_table, g_tx_pending_record.key,
-                   g_tx_pending_record.key_len,
-                   write_offset - region_addr);
-        handle->record_count++;
-        g_tx_pending = 0;
+    if (!g_tx_active) {
+        return KV_ERR_TRANSACTION;
     }
 
-    handle->tx_state = KV_TX_STATE_COMMITTED;
+    /* 临时关闭事务标志, 让set/del直接写入Flash */
+    g_tx_active = 0;
+
+    for (uint8_t i = 0; i < g_tx_count; i++) {
+        kv_tx_entry_t *entry = &g_tx_buffer[i];
+        int ret;
+
+        if (entry->is_delete) {
+            ret = flash_kv_del(entry->record.key, entry->record.key_len);
+            if (ret != KV_OK && ret != KV_ERR_NOT_FOUND) {
+                handle->tx_state = KV_TX_STATE_IDLE;
+                g_tx_count = 0;
+                return ret;
+            }
+        } else {
+            ret = flash_kv_set(entry->record.key, entry->record.key_len,
+                              entry->record.value, entry->record.value_len);
+            if (ret != KV_OK) {
+                handle->tx_state = KV_TX_STATE_IDLE;
+                g_tx_count = 0;
+                return ret;
+            }
+        }
+    }
+
     handle->tx_state = KV_TX_STATE_IDLE;
+    g_tx_count = 0;
     return KV_OK;
 }
 
 int flash_kv_tx_rollback(void)
 {
     kv_handle_t *handle = &g_handles[0];
-    g_tx_pending = 0;
-    memset(&g_tx_pending_record, 0, sizeof(g_tx_pending_record));
+    g_tx_active = 0;
+    g_tx_count = 0;
     handle->tx_state = KV_TX_STATE_IDLE;
     return KV_OK;
 }
 
-/* GC接口 - 垃圾回收 */
+/*============================================================================
+ * GC - 垃圾回收
+ *============================================================================*/
+
 int flash_kv_gc(void)
 {
     kv_handle_t *handle = &g_handles[0];
@@ -462,41 +582,63 @@ int flash_kv_gc(void)
         return KV_ERR_FLASH_FAIL;
     }
 
-    /* 扫描当前区域的有效记录 */
-    uint32_t offset = sizeof(kv_region_header_t);
+    /* 扫描当前区域, 复制有效记录到备用区域 */
+    uint32_t read_offset = sizeof(kv_region_header_t);
     uint32_t write_offset = sizeof(kv_region_header_t);
+    uint32_t max_offset = handle->region_size - handle->block_size;
     kv_record_t record;
     uint32_t new_record_count = 0;
 
-    /* 重建临时哈希表 */
+    /* 使用临时哈希表 */
     kv_hash_table_t new_hash_table;
     kv_hash_init(&new_hash_table);
 
-    while (offset < handle->region_size - handle->block_size) {
-        if (handle->ops->read(active_addr + offset, (uint8_t *)&record,
+    while (read_offset + sizeof(kv_record_t) <= max_offset) {
+        if (handle->ops->read(active_addr + read_offset, (uint8_t *)&record,
                              sizeof(record)) != 0) {
             break;
         }
 
-        /* 检查CRC有效性且flags=1(VALID) */
-        if (kv_record_check_crc(&record) == 0 && record.flags == 1) {
-            /* 复制有效记录到备用区域 - 使用kv_record_write来重新计算CRC */
+        /* 遇到擦除态, 没有更多记录 */
+        if (record.flags == KV_FLAG_ERASED) {
+            break;
+        }
+
+        /* 只复制有效记录 (CRC正确且未删除) */
+        if (record.flags == KV_FLAG_VALID && kv_record_check_crc(&record) == 0) {
+            /* 检查是否已有同key记录 (去重: 保留最新的) */
+            uint32_t existing;
+            if (kv_hash_get(&new_hash_table, record.key, record.key_len,
+                           &existing) == 0) {
+                /* 已存在, 后面的覆盖前面的 */
+            } else {
+                new_record_count++;
+            }
+
+            /* 写入到新区域 */
             if (kv_record_write(handle, inactive_addr + write_offset, &record) != 0) {
                 return KV_ERR_FLASH_FAIL;
             }
 
-            /* 更新临时哈希表 - 使用新的偏移量 */
             kv_hash_set(&new_hash_table, record.key, record.key_len,
                        write_offset);
             write_offset += sizeof(kv_record_t);
-            new_record_count++;
         }
-        offset += sizeof(kv_record_t);
+
+        read_offset += sizeof(kv_record_t);
     }
 
     /* 切换活跃区域 */
     handle->active_region = inactive;
-    handle->record_count = new_record_count;
+    handle->record_count = new_hash_table.count;
+    handle->active_offset = write_offset;
+    handle->version++;
+    handle->tx_state = KV_TX_STATE_IDLE;
+
+    /* 写入新区域头部 */
+    if (kv_region_header_write(handle, inactive) != 0) {
+        return KV_ERR_FLASH_FAIL;
+    }
 
     /* 替换哈希表 */
     memcpy(&g_hash_table, &new_hash_table, sizeof(kv_hash_table_t));
@@ -507,35 +649,84 @@ int flash_kv_gc(void)
 uint8_t flash_kv_free_percent(void)
 {
     kv_handle_t *handle = &g_handles[0];
-    uint32_t used = handle->record_count * sizeof(kv_record_t);
-    uint32_t total = handle->region_size - handle->block_size - sizeof(kv_region_header_t);
+    uint32_t total = handle->region_size - handle->block_size -
+                     sizeof(kv_region_header_t);
+    uint32_t used = handle->active_offset - sizeof(kv_region_header_t);
     if (total == 0) return 0;
+    if (used > total) return 0;
     return (uint8_t)((total - used) * 100 / total);
 }
 
-/* 批量操作接口 - 简化实现 */
+/*============================================================================
+ * 遍历、清空、统计
+ *============================================================================*/
+
 int flash_kv_foreach(kv_foreach_cb callback, void *user_data)
 {
-    (void)callback;
-    (void)user_data;
-    return KV_ERR_NOT_FOUND;
+    if (callback == NULL) {
+        return KV_ERR_INVALID_PARAM;
+    }
+
+    kv_handle_t *handle = &g_handles[0];
+    if (handle->ops == NULL) {
+        return KV_ERR_NO_INIT;
+    }
+
+    uint32_t region_addr = handle->region_addr[handle->active_region];
+    uint32_t offset = sizeof(kv_region_header_t);
+    uint32_t max_offset = handle->region_size - handle->block_size;
+    kv_record_t record;
+
+    while (offset + sizeof(kv_record_t) <= max_offset) {
+        if (handle->ops->read(region_addr + offset, (uint8_t *)&record,
+                             sizeof(record)) != 0) {
+            break;
+        }
+
+        if (record.flags == KV_FLAG_ERASED) {
+            break;
+        }
+
+        if (record.flags == KV_FLAG_VALID && kv_record_check_crc(&record) == 0) {
+            /* 确认该记录是当前有效版本 (哈希表中的offset匹配) */
+            uint32_t hash_offset;
+            if (kv_hash_get(&g_hash_table, record.key, record.key_len,
+                           &hash_offset) == 0 && hash_offset == offset) {
+                int ret = callback(record.key, record.key_len,
+                                  record.value, record.value_len, user_data);
+                if (ret != 0) {
+                    return KV_OK;  /* 用户请求终止遍历 */
+                }
+            }
+        }
+
+        offset += sizeof(kv_record_t);
+    }
+
+    return KV_OK;
 }
 
 int flash_kv_clear(void)
 {
     kv_handle_t *handle = &g_handles[0];
-
-    /* 擦除当前活跃区域 */
-    if (handle->ops && handle->ops->erase) {
-        handle->ops->erase(handle->region_addr[handle->active_region],
-                          handle->region_size);
+    if (handle->ops == NULL) {
+        return KV_ERR_NO_INIT;
     }
 
-    /* 清除内存中的哈希表和计数 */
+    /* 擦除当前活跃区域 */
+    if (handle->ops->erase(handle->region_addr[handle->active_region],
+                          handle->region_size) != 0) {
+        return KV_ERR_FLASH_FAIL;
+    }
+
+    /* 重置内存状态 */
     kv_hash_init(&g_hash_table);
     handle->record_count = 0;
+    handle->active_offset = sizeof(kv_region_header_t);
+    handle->version++;
 
-    return KV_OK;
+    /* 写入新的区域头部 */
+    return kv_region_header_write(handle, handle->active_region);
 }
 
 uint32_t flash_kv_count(void)
@@ -546,7 +737,11 @@ uint32_t flash_kv_count(void)
 int flash_kv_status(uint32_t *total, uint32_t *used)
 {
     kv_handle_t *handle = &g_handles[0];
-    *total = handle->region_size - handle->block_size - sizeof(kv_region_header_t);
-    *used = handle->record_count * sizeof(kv_record_t);
+    if (total == NULL || used == NULL) {
+        return KV_ERR_INVALID_PARAM;
+    }
+    *total = handle->region_size - handle->block_size -
+             sizeof(kv_region_header_t);
+    *used = handle->active_offset - sizeof(kv_region_header_t);
     return KV_OK;
 }

@@ -211,7 +211,7 @@ flash_kv/
 │   32     │  value        │  64B    │  Value数据 (不足补0)      │
 │   96     │  key_len      │   1B    │  实际Key长度              │
 │   97     │  value_len    │   1B    │  实际Value长度           │
-│   98     │  flags        │   1B    │  bit0:valid, bit1:del   │
+│   98     │  flags        │   1B    │  0xFF:空, 0xFE:有效, 0xFC:删除 │
 │   99     │  reserved[1]  │   1B    │  保留                     │
 │  100     │  crc16        │   2B    │  CRC-16校验               │
 ├──────────┼───────────────┼─────────┼────────────────────────────┤
@@ -241,13 +241,18 @@ flash_kv/
 
 ### 4.4 哈希表设计
 
-采用**开放寻址法 (Open Addressing)** 解决哈希冲突：
+采用**开放寻址法 (Open Addressing)** 解决哈希冲突，使用**墓碑 (Tombstone)** 机制处理删除：
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                      哈希表结构                                  │
 ├─────────────────────────────────────────────────────────────────┤
 │  FLASH_KV_HASH_SIZE = 1024 (必须是2的幂)                        │
+├─────────────────────────────────────────────────────────────────┤
+│  Slot状态:                                                      │
+│    key_len == 0    → 空槽 (未使用, 探测终止)                     │
+│    key_len == 0xFF → 墓碑 (已删除, 探测继续)                     │
+│    key_len == 1~32 → 有效槽                                     │
 ├─────────────────────────────────────────────────────────────────┤
 │  Slot[0]   →  {key_len, key, flash_offset}                     │
 │  Slot[1]   →  {key_len, key, flash_offset}                     │
@@ -294,13 +299,18 @@ typedef struct {
     int (*erase)(uint32_t addr, uint32_t len);           // 擦除
 } flash_kv_ops_t;
 
+/* 记录标志位 (Flash兼容: 状态转换只需bit清零 1→0) */
+#define KV_FLAG_ERASED   0xFF  // 空槽 (擦除态)
+#define KV_FLAG_VALID    0xFE  // 有效记录 (清0x01: 0xFF→0xFE)
+#define KV_FLAG_DELETED  0xFC  // 已删除 (清0x02: 0xFE→0xFC)
+
 /* KV记录 */
 typedef struct {
     uint8_t key[FLASH_KV_KEY_SIZE];     // 32字节Key
     uint8_t value[FLASH_KV_VALUE_SIZE]; // 64字节Value
     uint8_t key_len;                     // 实际Key长度
     uint8_t value_len;                   // 实际Value长度
-    uint8_t flags;                       // bit0:有效, bit1:删除
+    uint8_t flags;                       // 0xFF:空, 0xFE:有效, 0xFC:删除
     uint8_t reserved[1];
     uint16_t crc16;                      // CRC-16校验
 } __attribute__((packed)) kv_record_t;
@@ -310,7 +320,8 @@ typedef struct kv_handle {
     uint8_t instance_id;                  // 实例ID
     uint32_t active_region;              // 当前活跃区域 (0=A, 1=B)
     uint32_t version;                     // 版本号
-    uint32_t record_count;               // 记录数
+    uint32_t record_count;               // 有效记录数
+    uint32_t active_offset;              // 下一条记录写入位置(相对区域起始)
     kv_tx_state_persist_t tx_state;      // 事务状态
     uint32_t region_addr[2];             // A/B区域地址
     uint32_t region_size;                 // 区域大小
@@ -320,7 +331,7 @@ typedef struct kv_handle {
 
 /* 哈希表槽 */
 typedef struct {
-    uint8_t key_len;                      // Key长度
+    uint8_t key_len;                      // Key长度 (0=空, 0xFF=墓碑, 1~32=有效)
     uint8_t key[FLASH_KV_KEY_SIZE];      // Key数据
     uint32_t flash_offset;                // Flash偏移
 } kv_hash_slot_t;

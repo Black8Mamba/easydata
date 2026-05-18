@@ -58,6 +58,14 @@ typedef struct {
 #define KV_MAGIC_B            0x4B565342
 
 /*============================================================================
+ * 记录标志位定义 (Flash兼容: 状态转换只需清零bit, 即1→0)
+ * 擦除态 0xFF → 有效 0xFE (清bit0) → 删除 0xFC (清bit1)
+ *============================================================================*/
+#define KV_FLAG_ERASED        0xFF
+#define KV_FLAG_VALID         0xFE
+#define KV_FLAG_DELETED       0xFC
+
+/*============================================================================
  * 事务状态 (持久化到Flash)
  *============================================================================*/
 typedef enum {
@@ -74,6 +82,7 @@ typedef struct kv_handle {
     uint32_t active_region;
     uint32_t version;
     uint32_t record_count;
+    uint32_t active_offset;    /* 下一条记录写入位置(相对区域起始) */
     kv_tx_state_persist_t tx_state;
     uint32_t region_addr[2];
     uint32_t region_size;
@@ -109,7 +118,13 @@ typedef struct {
 
 /*============================================================================
  * 哈希表槽
+ * key_len == 0    : 空槽 (从未使用)
+ * key_len == 0xFF : 墓碑 (已删除, 探测链继续)
+ * key_len == 1~32 : 有效槽
  *============================================================================*/
+#define KV_HASH_SLOT_EMPTY     0
+#define KV_HASH_SLOT_TOMBSTONE 0xFF
+
 typedef struct {
     uint8_t  key_len;
     uint8_t  key[FLASH_KV_KEY_SIZE];
